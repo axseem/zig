@@ -633,42 +633,15 @@ pub const File = struct {
     pub const FlushDebugInfoError = Dwarf.FlushError;
 
     pub const UpdateNavError = error{
-        OutOfMemory,
         Overflow,
-        Underflow,
-        FileTooBig,
-        InputOutput,
-        FilesOpenedWithWrongFlags,
-        IsDir,
-        NoSpaceLeft,
-        Unseekable,
-        PermissionDenied,
-        SwapFile,
-        CorruptedData,
-        SystemResources,
-        OperationAborted,
-        BrokenPipe,
-        ConnectionResetByPeer,
-        ConnectionTimedOut,
-        SocketNotConnected,
-        NotOpenForReading,
-        WouldBlock,
-        Canceled,
-        AccessDenied,
-        Unexpected,
-        DiskQuota,
-        NotOpenForWriting,
-        AnalysisFail,
+        OutOfMemory,
+        /// Indicates the error is already reported and stored in
+        /// `failed_codegen` on the Zcu.
         CodegenFail,
-        EmitFail,
-        NameTooLong,
-        CurrentWorkingDirectoryUnlinked,
-        LockViolation,
-        NetNameDeleted,
-        DeviceBusy,
-        InvalidArgument,
-        HotSwapUnavailableOnHostOperatingSystem,
-    } || UpdateDebugInfoError;
+        /// Indicates the error is already reported and stored in `link_diags`
+        /// on the Compilation.
+        LinkFailure,
+    };
 
     /// Called from within CodeGen to retrieve the symbol index of a global symbol.
     /// If no symbol exists yet with this name, a new undefined global symbol will
@@ -870,6 +843,7 @@ pub const File = struct {
             .c => unreachable,
             .spirv => unreachable,
             .nvptx => unreachable,
+            .wasm => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).getNavVAddr(pt, nav_index, reloc_info);
@@ -901,6 +875,7 @@ pub const File = struct {
             .c => unreachable,
             .spirv => unreachable,
             .nvptx => unreachable,
+            .wasm => unreachable,
             inline else => |tag| {
                 dev.check(tag.devFeature());
                 return @as(*tag.Type(), @fieldParentPtr("base", base)).getUavVAddr(decl_val, reloc_info);

@@ -385,7 +385,13 @@ fn addPathComponents(self: *Plan9, path: []const u8, a: *std.ArrayList(u8)) !voi
     }
 }
 
-pub fn updateFunc(self: *Plan9, pt: Zcu.PerThread, func_index: InternPool.Index, air: Air, liveness: Liveness) !void {
+pub fn updateFunc(
+    self: *Plan9,
+    pt: Zcu.PerThread,
+    func_index: InternPool.Index,
+    air: Air,
+    liveness: Liveness,
+) link.File.UpdateNavError!void {
     if (build_options.skip_non_native and builtin.object_format != .plan9) {
         @panic("Attempted to compile for object format that was disabled by build configuration");
     }
@@ -437,7 +443,7 @@ pub fn updateFunc(self: *Plan9, pt: Zcu.PerThread, func_index: InternPool.Index,
     return self.updateFinish(pt, func.owner_nav);
 }
 
-pub fn updateNav(self: *Plan9, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
+pub fn updateNav(self: *Plan9, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link.File.UpdateNavError!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const ip = &zcu.intern_pool;
@@ -618,7 +624,7 @@ pub fn flushModule(self: *Plan9, arena: Allocator, tid: Zcu.PerThread.Id, prog_n
             .{ .kind = .code, .ty = .anyerror_type },
             metadata.text_atom,
         ) catch |err| return switch (err) {
-            error.CodegenFail => error.FlushFailure,
+            error.CodegenFail => error.LinkFailure,
             else => |e| e,
         };
         if (metadata.rodata_state != .unused) self.updateLazySymbolAtom(
@@ -626,7 +632,7 @@ pub fn flushModule(self: *Plan9, arena: Allocator, tid: Zcu.PerThread.Id, prog_n
             .{ .kind = .const_data, .ty = .anyerror_type },
             metadata.rodata_atom,
         ) catch |err| return switch (err) {
-            error.CodegenFail => error.FlushFailure,
+            error.CodegenFail => error.LinkFailure,
             else => |e| e,
         };
     }

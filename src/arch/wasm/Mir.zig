@@ -8,6 +8,7 @@
 
 const Mir = @This();
 const InternPool = @import("../../InternPool.zig");
+const Wasm = @import("../../link/Wasm.zig");
 
 const std = @import("std");
 
@@ -79,10 +80,10 @@ pub const Inst = struct {
         ///
         /// Uses `nop`
         @"return" = 0x0F,
-        /// Calls a function by its index.
-        ///
-        /// Uses `label`.
-        call = 0x10,
+        /// Calls a function using `nav_index`.
+        call_nav,
+        /// Calls a function using `func_index`.
+        call_func,
         /// Calls a function pointer by its function signature
         /// and index into the function table.
         ///
@@ -95,11 +96,7 @@ pub const Inst = struct {
         call_tag_name,
         /// Contains a symbol to a function pointer
         /// uses `label`
-        ///
-        /// Note: This uses `0x16` as value which is reserved by the WebAssembly
-        /// specification but unused, meaning we must update this if the specification were to
-        /// use this value.
-        function_index = 0x16,
+        function_index,
         /// Pops three values from the stack and pushes
         /// the first or second value dependent on the third value.
         /// Uses `tag`
@@ -586,7 +583,10 @@ pub const Inst = struct {
         ///
         /// Used by e.g. `br_table`
         payload: u32,
+
         ip_index: InternPool.Index,
+        nav_index: InternPool.Nav.Index,
+        func_index: Wasm.FunctionIndex,
     };
 };
 

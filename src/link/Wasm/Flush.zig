@@ -8,6 +8,7 @@ const Zcu = @import("../../Zcu.zig");
 const Alignment = Wasm.Alignment;
 const String = Wasm.String;
 const Relocation = Wasm.Relocation;
+const InternPool = @import("../../InternPool.zig");
 
 const build_options = @import("build_options");
 
@@ -18,13 +19,6 @@ const leb = std.leb;
 const log = std.log.scoped(.link);
 const assert = std.debug.assert;
 
-function_imports: std.AutoArrayHashMapUnmanaged(Wasm.FunctionImportId, void) = .empty,
-global_imports: std.AutoArrayHashMapUnmanaged(Wasm.GlobalImportId, void) = .empty,
-/// Ordered list of non-import functions that will appear in the final
-/// binary.
-functions: std.AutoArrayHashMapUnmanaged(Wasm.FunctionImport.Resolution, void) = .empty,
-/// Ordered list of non-import globals that will appear in the final binary.
-globals: std.AutoArrayHashMapUnmanaged(Wasm.GlobalImport.Resolution, void) = .empty,
 /// Ordered list of data segments that will appear in the final binary.
 /// When sorted, to-be-merged segments will be made adjacent.
 /// Values are offset relative to segment start.
@@ -33,40 +27,14 @@ data_segments: std.AutoArrayHashMapUnmanaged(Wasm.DataSegment.Index, u32) = .emp
 /// the next element in this array will contain the total merged segment size.
 data_segment_groups: std.ArrayListUnmanaged(u32) = .empty,
 
-indirect_function_table: std.AutoArrayHashMapUnmanaged(OutputFunctionIndex, u32) = .empty,
 binary_bytes: std.ArrayListUnmanaged(u8) = .empty,
+missing_exports: std.AutoArrayHashMapUnmanaged(String, void) = .empty,
 
-/// Empty when outputting an object.
-function_exports: std.ArrayListUnmanaged(FunctionIndex) = .empty,
-global_exports: std.ArrayListUnmanaged(GlobalIndex) = .empty,
-
-/// Tracks whether this is the first flush or subsequent flush.
-/// This flag is not reset during `clear`.
-subsequent: bool = false,
+indirect_function_table: std.AutoArrayHashMapUnmanaged(Wasm.OutputFunctionIndex, u32) = .empty,
 
 /// 0. Index into `data_segments`.
 const DataSegmentIndex = enum(u32) {
     _,
-};
-
-/// 0. Index into `function_imports`
-/// 1. Index into `functions`.
-const OutputFunctionIndex = enum(u32) {
-    _,
-};
-
-/// Index into `functions`.
-const FunctionIndex = enum(u32) {
-    _,
-};
-
-/// Index into `globals`.
-const GlobalIndex = enum(u32) {
-    _,
-
-    fn key(index: GlobalIndex, f: *const Flush) *Wasm.GlobalImport.Resolution {
-        return &f.globals.items[@intFromEnum(index)];
-    }
 };
 
 pub fn clear(f: *Flush) void {
@@ -96,7 +64,7 @@ pub fn deinit(f: *Flush, gpa: Allocator) void {
     f.* = undefined;
 }
 
-pub fn finish(f: *Flush, wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id) anyerror!void {
+pub fn finish(f: *Flush, wasm: *Wasm, arena: Allocator) anyerror!void {
     const comp = wasm.base.comp;
     const shared_memory = comp.config.shared_memory;
     const diags = &comp.link_diags;
@@ -104,73 +72,60 @@ pub fn finish(f: *Flush, wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id) a
     const import_memory = comp.config.import_memory;
     const export_memory = comp.config.export_memory;
     const target = comp.root_mod.resolved_target.result;
-    const rdynamic = comp.config.rdynamic;
     const is_obj = comp.config.output_mode == .Obj;
     const allow_undefined = is_obj or wasm.import_symbols;
+    const zcu = wasm.base.comp.zcu.?;
+    const ip: *const InternPool = &zcu.intern_pool; // No mutations allowed!
 
-    if (wasm.zig_object) |zo| {
-        try zo.populateErrorNameTable(wasm, tid);
-        try zo.setupErrorsLen(wasm);
-    }
+    if (wasm.any_exports_updated) {
+        wasm.any_exports_updated = false;
+        wasm.function_exports.shrinkRetainingCapacity(wasm.function_exports_len);
+        wasm.global_exports.shrinkRetainingCapacity(wasm.global_exports_len);
 
-    for (wasm.export_symbol_names) |exp_name| {
-        const exp_name_interned = try wasm.internString(exp_name);
-        if (wasm.object_function_imports.getPtr(exp_name_interned)) |*import| {
-            if (import.resolution != .unresolved) {
-                import.flags.exported = true;
-                continue;
+        const entry_name = if (wasm.entry_resolution.isNavOrUnresolved(wasm)) wasm.entry_name else .none;
+
+        try f.missing_exports.reinit(gpa, wasm.missing_exports_init, &.{});
+        for (wasm.nav_exports.keys()) |*nav_export| {
+            if (ip.isFunctionType(ip.getNav(nav_export.nav_index).typeOf(ip))) {
+                try wasm.function_exports.append(gpa, .fromNav(nav_export.nav_index, wasm));
+                if (nav_export.name.toOptional() == entry_name) {
+                    wasm.entry_resolution = .pack(wasm, .{ .nav = nav_export.nav_index });
+                } else {
+                    f.missing_exports.swapRemove(nav_export.name);
+                }
+            } else {
+                try wasm.global_exports.append(gpa, .fromNav(nav_export.nav_index));
+                f.missing_exports.swapRemove(nav_export.name);
             }
         }
-        if (wasm.object_global_imports.getPtr(exp_name_interned)) |*import| {
-            if (import.resolution != .unresolved) {
-                import.flags.exported = true;
-                continue;
-            }
+
+        for (f.missing_exports.keys()) |exp_name| {
+            if (exp_name != .none) continue;
+            diags.addError("manually specified export name '{s}' undefined", .{exp_name.slice(wasm)});
         }
-        diags.addError("manually specified export name '{s}' undefined", .{exp_name});
+
+        if (entry_name.unwrap()) |name| {
+            var err = try diags.addErrorWithNotes(1);
+            try err.addMsg("entry symbol '{s}' missing", .{name.slice(wasm)});
+            try err.addNote("'-fno-entry' suppresses this error", .{});
+        }
     }
 
-    if (wasm.entry_name.unwrap()) |entry_name| e: {
-        if (wasm.object_function_imports.getPtr(entry_name)) |*import| {
-            if (import.resolution != .unresolved) {
-                import.flags.exported = true;
-                break :e;
-            }
+    if (!allow_undefined) {
+        for (wasm.function_imports.keys()) |function_import_id| {
+            const name, const src_loc = function_import_id.nameAndLoc(wasm);
+            diags.addSrcError(src_loc, "undefined function: {s}", .{name.slice(wasm)});
         }
-        var err = try diags.addErrorWithNotes(1);
-        try err.addMsg("entry symbol '{s}' missing", .{entry_name.slice(wasm)});
-        try err.addNote("'-fno-entry' suppresses this error", .{});
+        for (wasm.global_imports.keys()) |global_import_id| {
+            const name, const src_loc = global_import_id.nameAndLoc(wasm);
+            diags.addSrcError(src_loc, "undefined global: {s}", .{name.slice(wasm)});
+        }
+        for (wasm.table_imports.keys()) |table_import_id| {
+            const name, const src_loc = table_import_id.nameAndLoc(wasm);
+            diags.addSrcError(src_loc, "undefined table: {s}", .{name.slice(wasm)});
+        }
     }
 
-    if (diags.hasErrors()) return error.LinkFailure;
-
-    if (f.subsequent) {
-        // Reset garbage collection state.
-        for (wasm.object_function_imports.values()) |*import| import.flags.alive = false;
-        for (wasm.object_global_imports.values()) |*import| import.flags.alive = false;
-        for (wasm.object_table_imports.values()) |*import| import.flags.alive = false;
-    }
-
-    // These loops do both recursive marking of alive symbols well as checking for undefined symbols.
-    // At the end, output_functions and output_globals will be populated.
-    for (wasm.object_function_imports.keys(), wasm.object_function_imports.values(), 0..) |name, *import, i| {
-        if (import.flags.isIncluded(rdynamic)) {
-            try markFunction(wasm, name, import, @enumFromInt(i), allow_undefined);
-            continue;
-        }
-    }
-    for (wasm.object_global_imports.keys(), wasm.object_global_imports.values(), 0..) |name, *import, i| {
-        if (import.flags.isIncluded(rdynamic)) {
-            try markGlobal(wasm, name, import, @enumFromInt(i), allow_undefined);
-            continue;
-        }
-    }
-    for (wasm.object_table_imports.keys(), wasm.object_table_imports.values(), 0..) |name, *import, i| {
-        if (import.flags.isIncluded(rdynamic)) {
-            try markTable(wasm, name, import, @enumFromInt(i), allow_undefined);
-            continue;
-        }
-    }
     if (diags.hasErrors()) return error.LinkFailure;
 
     // TODO only include init functions for objects with must_link=true or
@@ -666,6 +621,7 @@ pub fn finish(f: *Flush, wasm: *Wasm, arena: Allocator, tid: Zcu.PerThread.Id) a
             .__wasm_call_ctors => @panic("TODO lower __wasm_call_ctors"),
             .__wasm_init_memory => @panic("TODO lower __wasm_init_memory "),
             .__wasm_init_tls => @panic("TODO lower __wasm_init_tls "),
+            .__zig_error_names => @panic("TODO lower __zig_error_names "),
             .object_function => |i| {
                 _ = i;
                 _ = start_offset;
@@ -1128,147 +1084,6 @@ fn emitProducerSection(gpa: Allocator, binary_bytes: *std.ArrayListUnmanaged(u8)
 //    const size = @as(u32, @intCast(binary_bytes.items.len - header_offset - 6));
 //    try writeCustomSectionHeader(binary_bytes.items, header_offset, size);
 //}
-
-/// Recursively mark alive everything referenced by the function.
-fn markFunction(
-    wasm: *Wasm,
-    f: *Flush,
-    name: String,
-    import: *Wasm.FunctionImport,
-    func_index: Wasm.ObjectFunctionImportIndex,
-    allow_undefined: bool,
-) error{OutOfMemory}!void {
-    if (import.flags.alive) return;
-    import.flags.alive = true;
-
-    const comp = wasm.base.comp;
-    const gpa = comp.gpa;
-    const diags = &comp.link_diags;
-    const rdynamic = comp.config.rdynamic;
-    const is_obj = comp.config.output_mode == .Obj;
-
-    try f.functions.ensureUnusedCapacity(gpa, 1);
-
-    if (import.resolution == .unresolved) {
-        if (name == wasm.preloaded_strings.__wasm_init_memory) {
-            import.resolution = .__wasm_init_memory;
-            f.functions.putAssumeCapacity(.__wasm_init_memory, {});
-        } else if (name == wasm.preloaded_strings.__wasm_apply_global_tls_relocs) {
-            import.resolution = .__wasm_apply_global_tls_relocs;
-            f.functions.putAssumeCapacity(.__wasm_apply_global_tls_relocs, {});
-        } else if (name == wasm.preloaded_strings.__wasm_call_ctors) {
-            import.resolution = .__wasm_call_ctors;
-            f.functions.putAssumeCapacity(.__wasm_call_ctors, {});
-        } else if (name == wasm.preloaded_strings.__wasm_init_tls) {
-            import.resolution = .__wasm_init_tls;
-            f.functions.putAssumeCapacity(.__wasm_init_tls, {});
-        } else if (!allow_undefined) {
-            diags.addSrcError(import.source_location, "undefined function: {s}", .{name.slice(wasm)});
-        } else {
-            try f.function_imports.put(gpa, .fromObject(func_index), {});
-        }
-    } else {
-        const gop = f.functions.getOrPutAssumeCapacity(import.resolution);
-
-        if (!is_obj and import.flags.isExported(rdynamic))
-            try f.function_exports.append(gpa, @intCast(gop.index));
-
-        for (wasm.functionResolutionRelocSlice(import.resolution)) |reloc|
-            try wasm.markReloc(reloc);
-    }
-}
-
-/// Recursively mark alive everything referenced by the global.
-fn markGlobal(
-    wasm: *Wasm,
-    f: *Flush,
-    name: String,
-    import: *Wasm.GlobalImport,
-    global_index: Wasm.ObjectGlobalImportIndex,
-    allow_undefined: bool,
-) !void {
-    if (import.flags.alive) return;
-    import.flags.alive = true;
-
-    const comp = wasm.base.comp;
-    const gpa = comp.gpa;
-    const diags = &comp.link_diags;
-    const rdynamic = comp.config.rdynamic;
-    const is_obj = comp.config.output_mode == .Obj;
-
-    try f.globals.ensureUnusedCapacity(gpa, 1);
-
-    if (import.resolution == .unresolved) {
-        if (name == wasm.preloaded_strings.__heap_base) {
-            import.resolution = .__heap_base;
-            f.globals.putAssumeCapacity(.__heap_base, {});
-        } else if (name == wasm.preloaded_strings.__heap_end) {
-            import.resolution = .__heap_end;
-            f.globals.putAssumeCapacity(.__heap_end, {});
-        } else if (name == wasm.preloaded_strings.__stack_pointer) {
-            import.resolution = .__stack_pointer;
-            f.globals.putAssumeCapacity(.__stack_pointer, {});
-        } else if (name == wasm.preloaded_strings.__tls_align) {
-            import.resolution = .__tls_align;
-            f.globals.putAssumeCapacity(.__tls_align, {});
-        } else if (name == wasm.preloaded_strings.__tls_base) {
-            import.resolution = .__tls_base;
-            f.globals.putAssumeCapacity(.__tls_base, {});
-        } else if (name == wasm.preloaded_strings.__tls_size) {
-            import.resolution = .__tls_size;
-            f.globals.putAssumeCapacity(.__tls_size, {});
-        } else if (!allow_undefined) {
-            diags.addSrcError(import.source_location, "undefined global: {s}", .{name.slice(wasm)});
-        } else {
-            try f.global_imports.put(gpa, .fromObject(global_index), {});
-        }
-    } else {
-        const gop = f.globals.getOrPutAssumeCapacity(import.resolution);
-
-        if (!is_obj and import.flags.isExported(rdynamic))
-            try f.global_exports.append(gpa, @intCast(gop.index));
-
-        for (wasm.globalResolutionRelocSlice(import.resolution)) |reloc|
-            try wasm.markReloc(reloc);
-    }
-}
-
-fn markTable(wasm: *Wasm, f: *Flush, name: String, import: *Wasm.TableImport, table_index: Wasm.ObjectTableImportIndex, allow_undefined: bool) !void {
-    if (import.flags.alive) return;
-    import.flags.alive = true;
-
-    const comp = wasm.base.comp;
-    const gpa = comp.gpa;
-    const diags = &comp.link_diags;
-
-    try f.tables.ensureUnusedCapacity(gpa, 1);
-
-    if (import.resolution == .unresolved) {
-        if (name == wasm.preloaded_strings.__indirect_function_table) {
-            import.resolution = .__indirect_function_table;
-            f.tables.putAssumeCapacity(.__indirect_function_table, {});
-        } else if (!allow_undefined) {
-            diags.addSrcError(import.source_location, "undefined table: {s}", .{name.slice(wasm)});
-        } else {
-            try f.table_imports.put(gpa, .fromObject(table_index), {});
-        }
-    } else {
-        f.tables.putAssumeCapacity(import.resolution, {});
-        // Tables have no relocations.
-    }
-}
-
-fn globalResolutionRelocSlice(wasm: *Wasm, resolution: Wasm.GlobalImport.Resolution) ![]const Relocation {
-    assert(resolution != .none);
-    _ = wasm;
-    @panic("TODO");
-}
-
-fn functionResolutionRelocSlice(wasm: *Wasm, resolution: Wasm.FunctionImport.Resolution) ![]const Relocation {
-    assert(resolution != .none);
-    _ = wasm;
-    @panic("TODO");
-}
 
 fn isBss(wasm: *Wasm, name: String) bool {
     const s = name.slice(wasm);

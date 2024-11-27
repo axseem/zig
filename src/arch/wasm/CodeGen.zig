@@ -2153,7 +2153,7 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
     if (modifier == .always_tail) return func.fail("TODO implement tail calls for wasm", .{});
     const pl_op = func.air.instructions.items(.data)[@intFromEnum(inst)].pl_op;
     const extra = func.air.extraData(Air.Call, pl_op.payload);
-    const args = @as([]const Air.Inst.Ref, @ptrCast(func.air.extra[extra.end..][0..extra.data.args_len]));
+    const args: []const Air.Inst.Ref = @ptrCast(func.air.extra[extra.end..][0..extra.data.args_len]);
     const ty = func.typeOf(pl_op.operand);
 
     const pt = func.pt;
@@ -2172,41 +2172,14 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
         const func_val = (try func.air.value(pl_op.operand, pt)) orelse break :blk null;
 
         switch (ip.indexToKey(func_val.toIntern())) {
-            .func => |function| {
-                _ = try wasm.getOrCreateAtomForNav(pt, function.owner_nav);
-                break :blk function.owner_nav;
-            },
-            .@"extern" => |@"extern"| {
-                const ext_nav = ip.getNav(@"extern".owner_nav);
-                const ext_info = zcu.typeToFunc(Type.fromInterned(@"extern".ty)).?;
-                const func_type_index = try genFunctype(
-                    wasm,
-                    ext_info.cc,
-                    ext_info.param_types.get(ip),
-                    Type.fromInterned(ext_info.return_type),
-                    pt,
-                    func.target.*,
-                );
-                const atom_index = try wasm.getOrCreateAtomForNav(pt, @"extern".owner_nav);
-                const atom = atom_index.ptr(wasm);
-                try wasm.addOrUpdateImport(
-                    ext_nav.name.toSlice(ip),
-                    atom.sym_index,
-                    @"extern".lib_name.toSlice(ip),
-                    func_type_index,
-                );
-                break :blk @"extern".owner_nav;
-            },
+            inline .func, .@"extern" => |x| break :blk x.owner_nav,
             .ptr => |ptr| if (ptr.byte_offset == 0) switch (ptr.base_addr) {
-                .nav => |nav| {
-                    _ = try wasm.getOrCreateAtomForNav(pt, nav);
-                    break :blk nav;
-                },
+                .nav => |nav| break :blk nav,
                 else => {},
             },
             else => {},
         }
-        return func.fail("Expected a function, but instead found '{s}'", .{@tagName(ip.indexToKey(func_val.toIntern()))});
+        return func.fail("unable to lower callee to a function index", .{});
     };
 
     const sret: WValue = if (first_param_sret) blk: {
@@ -2224,9 +2197,8 @@ fn airCall(func: *CodeGen, inst: Air.Inst.Index, modifier: std.builtin.CallModif
         try func.lowerArg(zcu.typeToFunc(fn_ty).?.cc, arg_ty, arg_val);
     }
 
-    if (callee) |direct| {
-        const atom_index = wasm.zig_object.?.navs.get(direct).?.atom;
-        try func.addLabel(.call, @intFromEnum(wasm.getAtom(atom_index).sym_index));
+    if (callee) |nav_index| {
+        try func.addNav(.call_nav, nav_index);
     } else {
         // in this case we call a function pointer
         // so load its value onto the stack
@@ -7117,15 +7089,13 @@ fn callIntrinsic(
     args: []const WValue,
 ) InnerError!WValue {
     assert(param_types.len == args.len);
-    const symbol_index = func.bin_file.getGlobalSymbol(name, null) catch |err| {
-        return func.fail("Could not find or create global symbol '{s}'", .{@errorName(err)});
-    };
-
-    // Always pass over C-ABI
+    const wasm = func.bin_file;
     const pt = func.pt;
     const zcu = pt.zcu;
-    const func_type_index = try genFunctype(func.bin_file, .{ .wasm_watc = .{} }, param_types, return_type, pt, func.target.*);
-    try func.bin_file.addOrUpdateImport(name, symbol_index, null, func_type_index);
+    const func_type_index = try genFunctype(wasm, .{ .wasm_watc = .{} }, param_types, return_type, pt, func.target.*);
+    const func_index = wasm.getOutputFunction(try wasm.internString(name), func_type_index);
+
+    // Always pass over C-ABI
 
     const want_sret_param = firstParamSRet(.{ .wasm_watc = .{} }, return_type, pt, func.target.*);
     // if we want return as first param, we allocate a pointer to stack,
@@ -7144,7 +7114,7 @@ fn callIntrinsic(
     }
 
     // Actually call our intrinsic
-    try func.addLabel(.call, @intFromEnum(symbol_index));
+    try func.addLabel(.call_func, func_index);
 
     if (!return_type.hasRuntimeBitsIgnoreComptime(zcu)) {
         return .none;

@@ -82,11 +82,17 @@ pub fn deinit(self: *NvPtx) void {
     self.llvm_object.deinit();
 }
 
-pub fn updateFunc(self: *NvPtx, pt: Zcu.PerThread, func_index: InternPool.Index, air: Air, liveness: Liveness) !void {
+pub fn updateFunc(
+    self: *NvPtx,
+    pt: Zcu.PerThread,
+    func_index: InternPool.Index,
+    air: Air,
+    liveness: Liveness,
+) link.File.UpdateNavError!void {
     try self.llvm_object.updateFunc(pt, func_index, air, liveness);
 }
 
-pub fn updateNav(self: *NvPtx, pt: Zcu.PerThread, nav: InternPool.Nav.Index) !void {
+pub fn updateNav(self: *NvPtx, pt: Zcu.PerThread, nav: InternPool.Nav.Index) link.File.UpdateNavError!void {
     return self.llvm_object.updateNav(pt, nav);
 }
 

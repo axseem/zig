@@ -181,7 +181,7 @@ pub fn updateFunc(
     func_index: InternPool.Index,
     air: Air,
     liveness: Liveness,
-) !void {
+) link.File.UpdateNavError!void {
     const zcu = pt.zcu;
     const gpa = zcu.gpa;
     const func = zcu.funcInfo(func_index);
@@ -303,7 +303,7 @@ fn updateUav(self: *C, pt: Zcu.PerThread, i: usize) !void {
     };
 }
 
-pub fn updateNav(self: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) !void {
+pub fn updateNav(self: *C, pt: Zcu.PerThread, nav_index: InternPool.Nav.Index) link.File.UpdateNavError!void {
     const tracy = trace(@src());
     defer tracy.end();
 
