@@ -12,10 +12,7 @@ const native_endian = builtin.cpu.arch.endian();
 /// https://github.com/ziglang/zig/issues/4082
 pub const page_size = switch (builtin.cpu.arch) {
     .wasm32, .wasm64 => 64 * 1024,
-    .aarch64 => switch (builtin.os.tag) {
-        .macos, .ios, .watchos, .tvos, .visionos => 16 * 1024,
-        else => 4 * 1024,
-    },
+    .aarch64 => 16 * 1024,
     .sparc64 => 8 * 1024,
     else => 4 * 1024,
 };
